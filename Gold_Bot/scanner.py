@@ -17,20 +17,37 @@ TELEGRAM_TOKEN = os.getenv("TELEGRAM_TOKEN")
 TELEGRAM_CHAT_ID = os.getenv("TELEGRAM_CHAT_ID")
 
 # --- SYMBOLS TO TRADE ---
-SYMBOLS = ["XAUUSD", "XAGUSD", "US500", "NZDUSD"]
-SYMBOL  = "XAUUSD"  # Default fallback
+SYMBOLS = ["XAUUSD", "XAGUSD", "US500", "US30", "BTCUSD", "QQQ.NAS", "NZDUSD"]
+
+# --- TIMEFRAMES PER SYMBOL ---
+SYMBOL_TIMEFRAMES = {
+    "XAUUSD":  [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+    "XAGUSD":  [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+    "US500":   [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+    "US30":    [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+    "BTCUSD":  [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+    "QQQ.NAS": [mt5.TIMEFRAME_M5, mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+    "NZDUSD":  [mt5.TIMEFRAME_M15, mt5.TIMEFRAME_M30, mt5.TIMEFRAME_H1, mt5.TIMEFRAME_H4],
+}
+
+TIMEFRAME_NAMES = {
+    mt5.TIMEFRAME_M5:  "5M",
+    mt5.TIMEFRAME_M15: "15M",
+    mt5.TIMEFRAME_M30: "30M",
+    mt5.TIMEFRAME_H1:  "1H",
+    mt5.TIMEFRAME_H4:  "4H",
+}
 
 # --- SETTINGS ---
-TIMEFRAME_30   = mt5.TIMEFRAME_M30
-TIMEFRAME_4H   = mt5.TIMEFRAME_H4
-TIMEFRAME_1H   = mt5.TIMEFRAME_H1
-RISK_PERCENT   = 0.01
-RR             = 3.0
+SYMBOL       = "XAUUSD"
+TIMEFRAME_4H = mt5.TIMEFRAME_H4
+TIMEFRAME_1H = mt5.TIMEFRAME_H1
+RISK_PERCENT = 0.01
+RR           = 3.0
 CHECK_INTERVAL = 60
-ADX_PERIOD     = 14
-ADX_THRESH     = 25
-ATR_PERIOD     = 14
-COOLDOWN_BARS  = 8
+ADX_PERIOD   = 14
+ADX_THRESH   = 25
+ATR_PERIOD   = 14
 
 # --- SESSIONS UTC ---
 LONDON_START  = 7
@@ -44,20 +61,16 @@ POSTNY_END    = 22
 
 # ═══════════════════════════════════════════
 # AUTO DST DETECTION
-# UK BST: last Sunday March → last Sunday October
 # ═══════════════════════════════════════════
 def get_bias_hours():
     now  = datetime.now(timezone.utc)
     year = now.year
-
     march_end = datetime(year, 4, 1, tzinfo=timezone.utc)
     bst_start = march_end - timedelta(days=(march_end.weekday() + 1) % 7)
     bst_start = bst_start.replace(hour=1)
-
-    oct_end = datetime(year, 11, 1, tzinfo=timezone.utc)
-    bst_end = oct_end - timedelta(days=(oct_end.weekday() + 1) % 7)
-    bst_end = bst_end.replace(hour=1)
-
+    oct_end   = datetime(year, 11, 1, tzinfo=timezone.utc)
+    bst_end   = oct_end - timedelta(days=(oct_end.weekday() + 1) % 7)
+    bst_end   = bst_end.replace(hour=1)
     is_bst = bst_start <= now < bst_end
     return (2, 6) if is_bst else (1, 5)
 
@@ -96,7 +109,7 @@ def connect_mt5():
     return True
 
 # ═══════════════════════════════════════════
-# GET CANDLES — symbol aware
+# GET CANDLES
 # ═══════════════════════════════════════════
 def get_candles(timeframe, count=500, symbol=None):
     sym   = symbol or SYMBOL
@@ -146,15 +159,12 @@ def calc_macd(series):
     return macd, signal
 
 # ═══════════════════════════════════════════
-# WEEKLY BIAS — Uses 1H candles
-# Monday bias_h1 and bias_h2 candles
-# 1H candle closes after 1 hour so bias
-# available much earlier than 4H approach
+# WEEKLY BIAS — 1H candles with forex fix
 # ═══════════════════════════════════════════
 def get_weekly_bias(df_1h):
     bias_h1, bias_h2 = get_bias_hours()
     df = df_1h.copy()
-    df['dow']  = df['time'].dt.dayofweek  # 0 = Monday
+    df['dow']  = df['time'].dt.dayofweek
     df['hour'] = df['time'].dt.hour
 
     mon = df[(df['dow'] == 0) & (df['hour'].isin([bias_h1, bias_h2]))]
@@ -173,8 +183,15 @@ def get_weekly_bias(df_1h):
     wb_high = this_week['high'].max()
     wb_low  = this_week['low'].min()
 
-    c = df['close'].iloc[-1]
+    # Forex fix — if range too tight expand to recent 24H
+    price_scale = wb_high if wb_high > 1 else 1
+    min_range   = price_scale * 0.001
+    if (wb_high - wb_low) < min_range:
+        recent  = df.tail(24)
+        wb_high = recent['high'].max()
+        wb_low  = recent['low'].min()
 
+    c = df['close'].iloc[-1]
     wk_bull = c > wb_high
     wk_bear = c < wb_low
 
@@ -188,10 +205,7 @@ def get_weekly_bias(df_1h):
     return wb_high, wb_low, wk_bull, wk_bear, wk_rev
 
 # ═══════════════════════════════════════════
-# DAILY BIAS — Uses 1H candles
-# Daily bias_h1 candle each day
-# 1H candle closes after 1 hour so available
-# by 3AM UTC — well before London open
+# DAILY BIAS — 1H candles with forex fix
 # ═══════════════════════════════════════════
 def get_daily_bias(df_1h):
     bias_h1, _ = get_bias_hours()
@@ -212,15 +226,23 @@ def get_daily_bias(df_1h):
 
     db_high = daily_candle['high']
     db_low  = daily_candle['low']
-    c       = df['close'].iloc[-1]
 
+    # Forex fix — if range too tight expand to recent 8H
+    price_scale = db_high if db_high > 1 else 1
+    min_range   = price_scale * 0.0005
+    if (db_high - db_low) < min_range:
+        recent  = df.tail(8)
+        db_high = recent['high'].max()
+        db_low  = recent['low'].min()
+
+    c = df['close'].iloc[-1]
     d_bull = c > db_high
     d_bear = c < db_low
 
     return db_high, db_low, d_bull, d_bear
 
 # ═══════════════════════════════════════════
-# HTF EMA — 1H or 4H for 30M timeframe
+# HTF EMA
 # ═══════════════════════════════════════════
 def get_htf_ema(df_1h, df_4h):
     ema200_1h = calc_ema(df_1h['close'], 200).iloc[-1]
@@ -232,23 +254,19 @@ def get_htf_ema(df_1h, df_4h):
     return htf_bull, htf_bear
 
 # ═══════════════════════════════════════════
-# PREVIOUS DAY HIGH / LOW
+# PREVIOUS DAY / WEEK / MONTH LEVELS
 # ═══════════════════════════════════════════
-def get_prev_day_hl(df_30):
-    df = df_30.copy()
+def get_prev_day_hl(df):
+    df = df.copy()
     df['date'] = df['time'].dt.date
     dates = sorted(df['date'].unique())
     if len(dates) < 2:
         return None, None
-    prev_day = dates[-2]
-    prev = df[df['date'] == prev_day]
+    prev = df[df['date'] == dates[-2]]
     return prev['high'].max(), prev['low'].min()
 
-# ═══════════════════════════════════════════
-# PREVIOUS WEEK HIGH / LOW
-# ═══════════════════════════════════════════
-def get_prev_week_hl(df_30):
-    df = df_30.copy()
+def get_prev_week_hl(df):
+    df = df.copy()
     df['week'] = df['time'].dt.isocalendar().week
     df['year'] = df['time'].dt.isocalendar().year
     weeks = df[['year','week']].drop_duplicates().values.tolist()
@@ -258,11 +276,8 @@ def get_prev_week_hl(df_30):
     prev = df[(df['year'] == py) & (df['week'] == pw)]
     return prev['high'].max(), prev['low'].min()
 
-# ═══════════════════════════════════════════
-# PREVIOUS MONTH HIGH / LOW
-# ═══════════════════════════════════════════
-def get_prev_month_hl(df_30):
-    df = df_30.copy()
+def get_prev_month_hl(df):
+    df = df.copy()
     df['month'] = df['time'].dt.month
     df['year']  = df['time'].dt.year
     months = df[['year','month']].drop_duplicates().values.tolist()
@@ -401,18 +416,16 @@ def check_rsi_div(df, rsi_series):
     return (p_ll and r_hl), (p_hl and r_ll), (p_hh and r_lh), (p_lh and r_hh)
 
 # ═══════════════════════════════════════════
-# PLACE TRADE — symbol aware
+# PLACE TRADE
 # ═══════════════════════════════════════════
-def place_trade(signal, sl_price, tp_price, lot_size, symbol=None):
+def place_trade(signal, sl_price, tp_price, lot_size, symbol=None, tf_name="30M"):
     sym  = symbol or SYMBOL
     tick = mt5.symbol_info_tick(sym)
     if tick is None:
         send_telegram(f"❌ Failed to get price for {sym}!")
         return
-
     price      = tick.ask if signal == "BUY" else tick.bid
     order_type = mt5.ORDER_TYPE_BUY if signal == "BUY" else mt5.ORDER_TYPE_SELL
-
     req = {
         "action":       mt5.TRADE_ACTION_DEAL,
         "symbol":       sym,
@@ -423,23 +436,21 @@ def place_trade(signal, sl_price, tp_price, lot_size, symbol=None):
         "tp":           tp_price,
         "deviation":    20,
         "magic":        234000,
-        "comment":      "Mannys Bot V3",
+        "comment":      f"Mannys V3 {tf_name}",
         "type_time":    mt5.ORDER_TIME_GTC,
         "type_filling": mt5.ORDER_FILLING_IOC,
     }
-
     result  = mt5.order_send(req)
     account = mt5.account_info()
-
     if result.retcode != mt5.TRADE_RETCODE_DONE:
-        send_telegram(f"❌ <b>TRADE FAILED</b>\n{sym} {signal}\nError: {result.comment}")
+        send_telegram(f"❌ <b>TRADE FAILED</b>\n{sym} {tf_name} {signal}\nError: {result.comment}")
         print(f"Trade failed: {result.comment}")
     else:
         h1, _ = get_bias_hours()
         dst_str = "BST" if h1 == 2 else "GMT"
         send_telegram(
             f"🥇 <b>TRADE PLACED — Manny's V3</b>\n\n"
-            f"📊 {signal} | {sym}\n"
+            f"📊 {signal} | {sym} | {tf_name}\n"
             f"🏦 {get_session()} | {dst_str}\n"
             f"📈 Entry: {result.price}\n"
             f"🛑 SL: {sl_price}\n"
@@ -448,41 +459,53 @@ def place_trade(signal, sl_price, tp_price, lot_size, symbol=None):
             f"💼 Balance: {account.balance} GBP\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC"
         )
-        print(f"✅ {sym} {signal} | Entry:{result.price} SL:{sl_price} TP:{tp_price}")
+        print(f"✅ {sym} {tf_name} {signal} | Entry:{result.price} SL:{sl_price} TP:{tp_price}")
 
 # ═══════════════════════════════════════════
-# MAIN SIGNAL CHECK — symbol aware
+# MAIN SIGNAL CHECK
 # ═══════════════════════════════════════════
-def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
-    sym   = symbol or SYMBOL
-    df_30 = get_candles(TIMEFRAME_30, 500, sym)
-    df_4h = get_candles(TIMEFRAME_4H, 500, sym)
-    df_1h = get_candles(TIMEFRAME_1H, 500, sym)
+def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None, timeframe=None):
+    sym     = symbol or SYMBOL
+    tf      = timeframe or mt5.TIMEFRAME_M30
+    tf_name = TIMEFRAME_NAMES.get(tf, "30M")
 
-    if df_30 is None or df_4h is None or df_1h is None:
-        print(f"Failed to get candle data for {sym}")
+    df_main = get_candles(tf, 500, sym)
+    df_4h   = get_candles(TIMEFRAME_4H, 500, sym)
+    df_1h   = get_candles(TIMEFRAME_1H, 500, sym)
+
+    if df_main is None or df_4h is None or df_1h is None:
+        print(f"Failed to get candle data for {sym} {tf_name}")
         return last_signal_bar, last_bull_bar, last_bear_bar
 
-    if len(df_30) < 210:
-        print(f"Not enough data for EMA200 on {sym}")
+    if len(df_main) < 210:
+        print(f"Not enough data for EMA200 on {sym} {tf_name}")
         return last_signal_bar, last_bull_bar, last_bear_bar
 
     # --- INDICATORS ---
-    df_30['ema200'] = calc_ema(df_30['close'], 200)
-    df_30['ema50']  = calc_ema(df_30['close'], 50)
-    df_30['rsi']    = calc_rsi(df_30['close'], 14)
-    df_30['atr']    = calc_atr(df_30, ATR_PERIOD)
-    df_30['adx']    = calc_adx(df_30, ADX_PERIOD)
-    df_30['macd'], df_30['macd_sig'] = calc_macd(df_30['close'])
+    df_main['ema200'] = calc_ema(df_main['close'], 200)
+    df_main['ema50']  = calc_ema(df_main['close'], 50)
+    df_main['rsi']    = calc_rsi(df_main['close'], 14)
+    df_main['atr']    = calc_atr(df_main, ATR_PERIOD)
+    df_main['adx']    = calc_adx(df_main, ADX_PERIOD)
+    df_main['macd'], df_main['macd_sig'] = calc_macd(df_main['close'])
 
-    last        = df_30.iloc[-2]
+    last        = df_main.iloc[-2]
     current_bar = last['time']
-    bar_index   = len(df_30) - 2
+    bar_index   = len(df_main) - 2
+
+    # Cooldown scales with timeframe
+    tf_cooldown = {
+        mt5.TIMEFRAME_M5:  12,
+        mt5.TIMEFRAME_M15: 10,
+        mt5.TIMEFRAME_M30: 8,
+        mt5.TIMEFRAME_H1:  5,
+        mt5.TIMEFRAME_H4:  3,
+    }.get(tf, 8)
 
     bars_since_bull = (bar_index - last_bull_bar) if last_bull_bar is not None else 999
     bars_since_bear = (bar_index - last_bear_bar) if last_bear_bar is not None else 999
-    bull_cooled = bars_since_bull > COOLDOWN_BARS
-    bear_cooled = bars_since_bear > COOLDOWN_BARS
+    bull_cooled = bars_since_bull > tf_cooldown
+    bear_cooled = bars_since_bear > tf_cooldown
 
     close   = last['close']
     ema200  = last['ema200']
@@ -503,7 +526,7 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     rsi_bull_x = rsi < 40
     rsi_bear_x = rsi > 60
 
-    # --- BIAS using 1H candles ---
+    # --- BIAS ---
     wb_high, wb_low, wk_bull, wk_bear, wk_rev = get_weekly_bias(df_1h)
     price_in_weekly_range = (wb_high is not None) and (wb_low is not None) and (wb_low < close < wb_high)
     db_high, db_low, day_bull, day_bear        = get_daily_bias(df_1h)
@@ -514,7 +537,6 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     bias_med_bear = wk_bull and day_bear
     bias_sca_bull = price_in_weekly_range and day_bull
     bias_sca_bear = price_in_weekly_range and day_bear
-    macro_ok      = wk_bull or wk_bear
 
     # --- GATES ---
     g_str_bull = wk_bull and day_bull and htf_bull and (not ext_bear)
@@ -525,9 +547,9 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     g_sca_bear = price_in_weekly_range and day_bear and htf_bear and (not ext_bear)
 
     # --- LEVELS ---
-    d1h, d1l = get_prev_day_hl(df_30)
-    w_high, w_low = get_prev_week_hl(df_30)
-    m_high, m_low = get_prev_month_hl(df_30)
+    d1h, d1l      = get_prev_day_hl(df_main)
+    w_high, w_low = get_prev_week_hl(df_main)
+    m_high, m_low = get_prev_month_hl(df_main)
 
     w_mid   = (w_low + (w_high - w_low) / 2) if w_high and w_low else None
     in_disc = (close < w_mid) if w_mid else False
@@ -536,16 +558,16 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     m_bear  = (close < m_high and below_e200) if m_high else False
 
     # --- BOS ---
-    rec_bull_bos, rec_bear_bos = check_bos(df_30, df_30['atr'])
+    rec_bull_bos, rec_bear_bos = check_bos(df_main, df_main['atr'])
 
     # --- SWEEPS ---
-    bull_sweep, bear_sweep, bull_sw_rej, bear_sw_rej, last_bull_sw_low, last_bear_sw_high = check_sweeps(df_30, df_30['atr'], d1h, d1l)
+    bull_sweep, bear_sweep, bull_sw_rej, bear_sw_rej, last_bull_sw_low, last_bear_sw_high = check_sweeps(df_main, df_main['atr'], d1h, d1l)
 
     # --- INTERNAL SWEEP ---
-    int_bull, int_bear = check_internal_sweep(df_30, above_e200, below_e200)
+    int_bull, int_bear = check_internal_sweep(df_main, above_e200, below_e200)
 
     # --- EQUAL HIGHS/LOWS ---
-    eqh_swept, eql_swept = check_eql_swept(df_30, atr)
+    eqh_swept, eql_swept = check_eql_swept(df_main, atr)
 
     # --- TIER 2 ---
     s2_long  = sum([above_e200, rec_bull_bos, bull_sweep, in_disc, m_bull])
@@ -553,7 +575,7 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
 
     # --- FVG ---
     bull_fvg_ez, bear_fvg_ez = check_fvg(
-        df_30, df_30['atr'],
+        df_main, df_main['atr'],
         above_e200, below_e200,
         wk_bull, wk_bear, day_bull, day_bear,
         bias_med_bull, bias_med_bear,
@@ -561,10 +583,10 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     )
 
     # --- ORDER BLOCKS ---
-    bull_ob_rsp, bear_ob_rsp = check_ob(df_30, df_30['atr'], above_e200, below_e200)
+    bull_ob_rsp, bear_ob_rsp = check_ob(df_main, df_main['atr'], above_e200, below_e200)
 
     # --- RSI DIVERGENCE ---
-    s_bull_div, h_bull_div, s_bear_div, h_bear_div = check_rsi_div(df_30, df_30['rsi'])
+    s_bull_div, h_bull_div, s_bear_div, h_bear_div = check_rsi_div(df_main, df_main['rsi'])
 
     # --- TIER 3 TRIGGERS ---
     bull_wick = last['low']  - min(last['open'], last['close'])
@@ -579,13 +601,13 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     t3_bear = bear_sw_rej
     t4_bull = (bull_wick >= 2.5*pin_body) and (pin_body >= atr*0.1) and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull) and day_bull
     t4_bear = (bear_wick >= 2.5*pin_body) and (pin_body >= atr*0.1) and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear) and day_bear
-    t5_bull = (d1h is not None) and (close > d1h) and (df_30['close'].iloc[-3] <= d1h) and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull) and day_bull
-    t5_bear = (d1l is not None) and (close < d1l) and (df_30['close'].iloc[-3] >= d1l) and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear) and day_bear
+    t5_bull = (d1h is not None) and (close > d1h) and (df_main['close'].iloc[-3] <= d1h) and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull) and day_bull
+    t5_bear = (d1l is not None) and (close < d1l) and (df_main['close'].iloc[-3] >= d1l) and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear) and day_bear
 
-    lh1 = (df_30['high'].iloc[-2] < df_30['high'].iloc[-3]) and (df_30['high'].iloc[-3] < df_30['high'].iloc[-4]) and (df_30['high'].iloc[-4] < df_30['high'].iloc[-5])
-    hl1 = (df_30['low'].iloc[-2]  > df_30['low'].iloc[-3])  and (df_30['low'].iloc[-3]  > df_30['low'].iloc[-4])  and (df_30['low'].iloc[-4]  > df_30['low'].iloc[-5])
-    t7_bull = lh1 and (last['high'] > df_30['high'].iloc[-3]) and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull) and day_bull
-    t7_bear = hl1 and (last['low']  < df_30['low'].iloc[-3])  and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear) and day_bear
+    lh1 = (df_main['high'].iloc[-2] < df_main['high'].iloc[-3]) and (df_main['high'].iloc[-3] < df_main['high'].iloc[-4]) and (df_main['high'].iloc[-4] < df_main['high'].iloc[-5])
+    hl1 = (df_main['low'].iloc[-2]  > df_main['low'].iloc[-3])  and (df_main['low'].iloc[-3]  > df_main['low'].iloc[-4])  and (df_main['low'].iloc[-4]  > df_main['low'].iloc[-5])
+    t7_bull = lh1 and (last['high'] > df_main['high'].iloc[-3]) and above_e200 and (wk_bull or bias_med_bull or bias_sca_bull) and day_bull
+    t7_bear = hl1 and (last['low']  < df_main['low'].iloc[-3])  and below_e200 and (wk_bear or bias_med_bear or bias_sca_bear) and day_bear
 
     any_trig_bull = t1_bull or t2_bull or t3_bull or t4_bull or t5_bull or t7_bull
     any_trig_bear = t1_bear or t2_bear or t3_bear or t4_bear or t5_bear or t7_bear
@@ -628,12 +650,12 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
 
     # --- SL / TP ---
     sl_buf     = atr * 0.5
-    long_sl    = round((last_bull_sw_low - sl_buf) if last_bull_sw_low else (close - atr * 1.5), 2)
+    long_sl    = round((last_bull_sw_low - sl_buf) if last_bull_sw_low else (close - atr * 1.5), 5)
     long_risk  = max(close - long_sl, 0.0001)
-    short_sl   = round((last_bear_sw_high + sl_buf) if last_bear_sw_high else (close + atr * 1.5), 2)
+    short_sl   = round((last_bear_sw_high + sl_buf) if last_bear_sw_high else (close + atr * 1.5), 5)
     short_risk = max(short_sl - close, 0.0001)
-    long_tp    = round(close + long_risk  * 3, 2)
-    short_tp   = round(close - short_risk * 3, 2)
+    long_tp    = round(close + long_risk  * 3, 5)
+    short_tp   = round(close - short_risk * 3, 5)
 
     # --- POSITION SIZING ---
     account  = mt5.account_info()
@@ -648,12 +670,12 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
 
     # --- STATUS PRINT ---
     print(f"\n{'='*55}")
-    print(f"📈 {sym} | {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | {get_session()} | {dst_str}")
-    print(f"📊 Close:{close:.2f} EMA200:{ema200:.2f} EMA50:{ema50:.2f}")
-    print(f"📈 RSI:{rsi:.1f} ADX:{adx_val:.1f} ATR:{atr:.2f}")
+    print(f"📈 {sym} {tf_name} | {datetime.now(timezone.utc).strftime('%H:%M:%S')} UTC | {get_session()} | {dst_str}")
+    print(f"📊 Close:{close:.5f} EMA200:{ema200:.5f} EMA50:{ema50:.5f}")
+    print(f"📈 RSI:{rsi:.1f} ADX:{adx_val:.1f} ATR:{atr:.5f}")
     print(f"🧭 WkBull:{wk_bull} WkBear:{wk_bear} | DayBull:{day_bull} DayBear:{day_bear}")
-    print(f"📦 WkRange:{wb_high:.2f}-{wb_low:.2f}" if wb_high else "📦 WkRange: Not set yet")
-    print(f"🟢 DayRange:{db_high:.2f}-{db_low:.2f}" if db_high else "🟢 DayRange: Not set yet")
+    print(f"📦 WkRange:{wb_high:.5f}-{wb_low:.5f}" if wb_high else "📦 WkRange: Not set yet")
+    print(f"🟢 DayRange:{db_high:.5f}-{db_low:.5f}" if db_high else "🟢 DayRange: Not set yet")
     print(f"🔒 HTFBull:{htf_bull} HTFBear:{htf_bear} ExtBear:{ext_bear}")
     print(f"🏗 S2L:{s2_long}/5 S2S:{s2_short}/5 | BonL:{bon_l}/7 BonS:{bon_s}/7")
     print(f"🎯 TrigBull:{any_trig_bull} TrigBear:{any_trig_bear}")
@@ -663,48 +685,49 @@ def check_signal(last_signal_bar, last_bull_bar, last_bear_bar, symbol=None):
     # --- FIRE SIGNAL ---
     if raw_bull:
         emoji = "🔥" if bull_tier == "STRONG" else "💪" if bull_tier == "MEDIUM" else "⚡"
-        print(f"\n{emoji} BUY SIGNAL — {sym} — {bull_tier}")
+        print(f"\n{emoji} BUY SIGNAL — {sym} {tf_name} — {bull_tier}")
         send_telegram(
-            f"{emoji} <b>{bull_tier} BUY — {sym}</b>\n\n"
+            f"{emoji} <b>{bull_tier} BUY — {sym} {tf_name}</b>\n\n"
             f"📊 Manny's Strategy V3\n"
             f"🏦 {get_session()} | {dst_str}\n"
-            f"📈 Entry: {close:.2f}\n"
+            f"📈 Entry: {close:.5f}\n"
             f"🛑 SL: {long_sl}\n"
             f"🎯 TP: {long_tp}\n"
             f"📦 Lots: {long_sz}\n"
             f"🏗 S2:{s2_long}/5 Bonus:{bon_l}/7\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
         )
-        place_trade("BUY", long_sl, long_tp, long_sz, sym)
+        place_trade("BUY", long_sl, long_tp, long_sz, sym, tf_name)
         return current_bar, bar_index, last_bear_bar
 
     elif raw_bear:
         emoji = "🔥" if bear_tier == "STRONG" else "💪" if bear_tier == "MEDIUM" else "⚡"
-        print(f"\n{emoji} SELL SIGNAL — {sym} — {bear_tier}")
+        print(f"\n{emoji} SELL SIGNAL — {sym} {tf_name} — {bear_tier}")
         send_telegram(
-            f"{emoji} <b>{bear_tier} SELL — {sym}</b>\n\n"
+            f"{emoji} <b>{bear_tier} SELL — {sym} {tf_name}</b>\n\n"
             f"📊 Manny's Strategy V3\n"
             f"🏦 {get_session()} | {dst_str}\n"
-            f"📈 Entry: {close:.2f}\n"
+            f"📈 Entry: {close:.5f}\n"
             f"🛑 SL: {short_sl}\n"
             f"🎯 TP: {short_tp}\n"
             f"📦 Lots: {short_sz}\n"
             f"🏗 S2:{s2_short}/5 Bonus:{bon_s}/7\n"
             f"⏰ {datetime.now(timezone.utc).strftime('%H:%M')} UTC"
         )
-        place_trade("SELL", short_sl, short_tp, short_sz, sym)
+        place_trade("SELL", short_sl, short_tp, short_sz, sym, tf_name)
         return current_bar, last_bull_bar, bar_index
 
     return current_bar, last_bull_bar, last_bear_bar
 
 # ═══════════════════════════════════════════
-# MAIN LOOP — scans all symbols
+# MAIN LOOP
 # ═══════════════════════════════════════════
 def run():
     print("🚀 Manny's Strategy V3 — Mixed Bias Edition")
     print("📊 STRONG / MEDIUM / SCALP tiers")
     print("🕐 Auto DST detection active")
     print(f"📈 Scanning: {', '.join(SYMBOLS)}")
+    print(f"⏱ Timeframes: 5M, 15M, 30M, 1H, 4H")
     print("="*55)
 
     h1, h2  = get_bias_hours()
@@ -716,6 +739,7 @@ def run():
         f"📊 Mixed Bias — STRONG/MEDIUM/SCALP\n"
         f"🕐 {dst} | Bias: {h1}AM + {h2}AM UTC\n"
         f"📈 Pairs: {', '.join(SYMBOLS)}\n"
+        f"⏱ Timeframes: 5M, 15M, 30M, 1H, 4H\n"
         f"⏰ Scanning every 60 seconds\n"
         f"🏦 London | Overlap | NY | Post-NY"
     )
@@ -726,31 +750,40 @@ def run():
 
     print("✅ MT5 Connected!")
 
-    # Track signal state per symbol
-    signal_state = {
-        s: {"last_signal_bar": None, "last_bull_bar": None, "last_bear_bar": None}
-        for s in SYMBOLS
-    }
+    # Track signal state per symbol per timeframe
+    signal_state = {}
+    for s in SYMBOLS:
+        for tf in SYMBOL_TIMEFRAMES.get(s, [mt5.TIMEFRAME_M30]):
+            key = f"{s}_{TIMEFRAME_NAMES[tf]}"
+            signal_state[key] = {
+                "last_signal_bar": None,
+                "last_bull_bar":   None,
+                "last_bear_bar":   None
+            }
 
     while True:
         now = datetime.now(timezone.utc)
         if is_active_session():
             print(f"\n[{now.strftime('%H:%M:%S')} UTC] Scanning | {get_session()}")
             for sym in SYMBOLS:
-                try:
-                    state = signal_state[sym]
-                    new_sig, new_bull, new_bear = check_signal(
-                        state["last_signal_bar"],
-                        state["last_bull_bar"],
-                        state["last_bear_bar"],
-                        symbol=sym
-                    )
-                    signal_state[sym]["last_signal_bar"] = new_sig
-                    signal_state[sym]["last_bull_bar"]   = new_bull
-                    signal_state[sym]["last_bear_bar"]   = new_bear
-                except Exception as e:
-                    print(f"❌ {sym} Error: {e}")
-                    send_telegram(f"⚠️ {sym} error: {e}")
+                for tf in SYMBOL_TIMEFRAMES.get(sym, [mt5.TIMEFRAME_M30]):
+                    tf_name = TIMEFRAME_NAMES[tf]
+                    key     = f"{sym}_{tf_name}"
+                    try:
+                        state = signal_state[key]
+                        new_sig, new_bull, new_bear = check_signal(
+                            state["last_signal_bar"],
+                            state["last_bull_bar"],
+                            state["last_bear_bar"],
+                            symbol=sym,
+                            timeframe=tf
+                        )
+                        signal_state[key]["last_signal_bar"] = new_sig
+                        signal_state[key]["last_bull_bar"]   = new_bull
+                        signal_state[key]["last_bear_bar"]   = new_bear
+                    except Exception as e:
+                        print(f"❌ {sym} {tf_name} Error: {e}")
+                        send_telegram(f"⚠️ {sym} {tf_name} error: {e}")
         else:
             h1, _ = get_bias_hours()
             print(f"[{now.strftime('%H:%M:%S')} UTC] 💤 Asian — Next: London 07:00 UTC | Bias: {h1}AM")
