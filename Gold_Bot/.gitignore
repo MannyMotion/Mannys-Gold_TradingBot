@@ -5,3 +5,5 @@ __pycache__/
 .DS_Store
 ngrok.exe
 *.zip
+trade_journal.xlsx
+trade_log.csv
